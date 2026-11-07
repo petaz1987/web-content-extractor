@@ -227,7 +227,9 @@ def test_packaging_files_keep_render_path_and_image_only_compose():
     assert "build:" not in compose
     assert "ports:" not in compose
     assert "${WEB_CONTENT_EXTRACTOR_IMAGE:?" in compose
-    assert "ghcr.io/petaz1987/web-content-extractor@sha256:" in readme
+    immutable_reference = "ghcr.io/petaz1987/web-content-extractor@sha256:<placeholder-digest>"
+    assert f"`{immutable_reference}`" in readme
+    assert "Illustrative format only, not a real digest" in readme
     assert "USER 10001:10001" in dockerfile
     runtime_stage = dockerfile.split("FROM python-base AS runtime", 1)[1]
     assert "EXTRACT_API_TOKEN=" not in runtime_stage

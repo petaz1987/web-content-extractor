@@ -38,7 +38,9 @@ jobs:
           python-version: "3.12.16"
 
       - name: Run native test suite and static checks
+        shell: bash
         run: |
+          set -o pipefail
           python -m pip install -r requirements-dev.txt
           python -m pytest -q | tee /tmp/native-pytest-result.txt
           cat /tmp/native-pytest-result.txt >> "$GITHUB_STEP_SUMMARY"
@@ -136,7 +138,8 @@ jobs:
 
       - name: Record that public network smoke was not requested
         if: github.event_name != 'workflow_dispatch' || !inputs.network_smoke
-        run: echo "Optional public DNS/HTTPS smoke: not requested; deterministic tests remain the release gate." >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          echo "Optional public DNS/HTTPS smoke: not requested; deterministic tests remain the release gate." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stop validation container
         if: always()

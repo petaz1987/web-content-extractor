@@ -115,7 +115,7 @@ The repository's GitHub Actions workflow uses QEMU/Buildx to build ARM64 off the
 
 The image name is `ghcr.io/petaz1987/web-content-extractor`. Branch and pull-request validation cannot publish. An explicit manual workflow dispatch on `main` with `publish=true`, followed by approval through the protected `ghcr-publish` GitHub Environment, is required. Configure environment reviewers and restrictions in GitHub repository settings before using publication. The publication job reuses the exact ARM64 image tar that passed validation and records the source SHA, image ID, architecture, and actual registry digest. No image has been published by this local change, so no digest is provided here.
 
-Coolify uses `compose.coolify.yaml`, which requires `WEB_CONTENT_EXTRACTOR_IMAGE` to be an immutable GHCR `@sha256:` reference. It publishes no host port and creates no public domain or Traefik route. Configure private routing and firewall policy separately; the internal URL is intentionally unspecified.
+Coolify uses `compose.coolify.yaml`, which requires `WEB_CONTENT_EXTRACTOR_IMAGE` to be an immutable GHCR `@sha256:` reference. Illustrative format only, not a real digest: `ghcr.io/petaz1987/web-content-extractor@sha256:<placeholder-digest>`. Replace the placeholder with the digest from an approved publication. It publishes no host port and creates no public domain or Traefik route. Configure private routing and firewall policy separately; the internal URL is intentionally unspecified.
 
 Approved initial Coolify runtime values are:
 
