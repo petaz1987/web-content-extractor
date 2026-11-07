@@ -4,8 +4,11 @@ import hmac
 import ipaddress
 import json
 import logging
+import os
 import re
 import socket
+import sys
+import threading
 import time
 import unicodedata
 from email.message import Message
@@ -14,8 +17,9 @@ from urllib.parse import urljoin, urlsplit
 import requests
 import trafilatura
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
-from flask import Flask, jsonify, request
+from flask import Flask, current_app, has_app_context, jsonify, request
 from product_extraction import extract_product_content as _extract_product_html
+from runtime_config import load_runtime_config
 from search_extraction import extract_search_content as _extract_search_html
 
 LOG = logging.getLogger(__name__)
@@ -34,6 +38,7 @@ MAX_AGENT_JSONLD_OUTPUT_CHARS = 10_000
 AGENT_TRUNCATION_MARKER = "[content truncated]"
 TIMEOUT = (5, 10)
 USER_AGENT = "ExtractWebsite/1.0 (+https://github.com/petaz1987/extractwebsite)"
+_LOG_HANDLER_MARKER = "web_content_extractor_handler"
 ALLOWED_CONTENT_TYPES = {"text/html", "application/xhtml+xml"}
 SOFT_BLOCK_MARKERS = (
     "haz clic en el boton de abajo para seguir comprando",
@@ -64,7 +69,7 @@ def _resolve_public_addresses(hostname):
     try:
         answers = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
     except (OSError, socket.gaierror) as exc:
-        LOG.info("Target hostname could not be resolved")
+        LOG.warning("Target hostname resolution failed (%s)", type(exc).__name__)
         raise ExtractionError("upstream_fetch_failed", "The upstream host could not be resolved.", 502) from exc
 
     addresses = set()
@@ -111,6 +116,33 @@ def validate_url(url):
 
 def _safe_error(code, message, status):
     return jsonify({"error": {"code": code, "message": message}}), status
+
+
+def _configure_application_logging(level):
+    if not any(getattr(handler, _LOG_HANDLER_MARKER, False) for handler in LOG.handlers):
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        setattr(handler, _LOG_HANDLER_MARKER, True)
+        LOG.addHandler(handler)
+    LOG.setLevel(getattr(logging, level))
+    LOG.propagate = False
+
+
+def _wrapped_timeout_class(exc):
+    """Return only a recognized timeout class name from a bounded exception chain."""
+    pending = [exc]
+    seen = set()
+    while pending and len(seen) < 8:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        class_name = type(current).__name__
+        if class_name in {"ReadTimeoutError", "ConnectTimeoutError"}:
+            return class_name
+        pending.extend(candidate for candidate in (current.__cause__, current.__context__) if candidate is not None)
+        pending.extend(candidate for candidate in current.args if isinstance(candidate, BaseException))
+    return None
 
 
 def _read_bounded_body(response):
@@ -165,6 +197,7 @@ def _fetch_page(requested_url):
     session = requests.Session()
     session.trust_env = False
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml", "Accept-Encoding": "identity"}
+    timeout = current_app.config["UPSTREAM_TIMEOUT"] if has_app_context() else TIMEOUT
     try:
         while True:
             validate_url(current_url)
@@ -172,13 +205,34 @@ def _fetch_page(requested_url):
                 raise ExtractionError("redirect_loop", "The upstream redirect loop was blocked.", 502)
             visited.add(current_url)
 
+            fetch_start = time.perf_counter()
+            LOG.debug(
+                "Upstream fetch started connect_timeout_s=%s read_timeout_s=%s",
+                timeout[0], timeout[1],
+            )
             try:
-                response = session.get(current_url, headers=headers, timeout=TIMEOUT, allow_redirects=False, stream=True)
+                response = session.get(current_url, headers=headers, timeout=timeout, allow_redirects=False, stream=True)
+            except requests.ConnectTimeout as exc:
+                LOG.warning("Upstream connect timeout (%s)", type(exc).__name__)
+                raise ExtractionError("upstream_timeout", "The upstream server did not respond in time.", 504) from exc
+            except requests.ReadTimeout as exc:
+                LOG.warning("Upstream read timeout (%s)", type(exc).__name__)
+                raise ExtractionError("upstream_timeout", "The upstream server did not respond in time.", 504) from exc
             except requests.Timeout as exc:
+                LOG.warning("Upstream timeout (%s)", type(exc).__name__)
                 raise ExtractionError("upstream_timeout", "The upstream server did not respond in time.", 504) from exc
             except requests.RequestException as exc:
-                LOG.info("Upstream request failed (%s)", type(exc).__name__)
+                timeout_class = _wrapped_timeout_class(exc)
+                if timeout_class is not None:
+                    LOG.warning("Upstream request timeout (%s)", timeout_class)
+                    raise ExtractionError("upstream_timeout", "The upstream server did not respond in time.", 504) from exc
+                LOG.warning("Upstream request failed (%s)", type(exc).__name__)
                 raise ExtractionError("upstream_fetch_failed", "The upstream page could not be fetched.", 502) from exc
+
+            LOG.debug(
+                "Upstream response received status=%d elapsed_ms=%.1f",
+                response.status_code, (time.perf_counter() - fetch_start) * 1000,
+            )
 
             if response.is_redirect or response.is_permanent_redirect:
                 location = response.headers.get("Location")
@@ -209,6 +263,20 @@ def _fetch_page(requested_url):
             try:
                 body = _read_bounded_body(response)
                 html = _decode_html_body(body, response.headers.get("Content-Type", ""), response.encoding)
+                LOG.debug(
+                    "Upstream body received status=%d bytes=%d fetch_elapsed_ms=%.1f",
+                    response.status_code, len(body), (time.perf_counter() - fetch_start) * 1000,
+                )
+            except requests.Timeout as exc:
+                LOG.warning("Upstream body read timeout (%s)", type(exc).__name__)
+                raise ExtractionError("upstream_timeout", "The upstream server did not respond in time.", 504) from exc
+            except requests.RequestException as exc:
+                timeout_class = _wrapped_timeout_class(exc)
+                if timeout_class is not None:
+                    LOG.warning("Upstream body read timeout (%s)", timeout_class)
+                    raise ExtractionError("upstream_timeout", "The upstream server did not respond in time.", 504) from exc
+                LOG.warning("Upstream body read failed (%s)", type(exc).__name__)
+                raise ExtractionError("upstream_fetch_failed", "The upstream page could not be fetched.", 502) from exc
             finally:
                 response.close()
             return current_url, content_type, response.status_code, html
@@ -431,7 +499,9 @@ def _reduce_agent_page(soup):
 
 
 def extract_web_content(url):
+    total_start = time.perf_counter()
     final_url, content_type, status_code, html = _fetch_page(url)
+    fetch_end = time.perf_counter()
     soup = BeautifulSoup(html, "html.parser")
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
     meta = soup.find("meta", attrs={"name": lambda value: value and value.lower() == "description"})
@@ -444,6 +514,14 @@ def extract_web_content(url):
         main_text = ""
     main_text = _clean_text(main_text) or _fallback_text(soup)
     content_assessment = _content_assessment(title, main_text)
+    total_end = time.perf_counter()
+    LOG.debug(
+        "Full extraction timing: fetch_ms=%.1f parse_extract_ms=%.1f total_ms=%.1f html_chars=%d text_chars=%d",
+        (fetch_end - total_start) * 1000,
+        (total_end - fetch_end) * 1000,
+        (total_end - total_start) * 1000,
+        len(html), len(main_text),
+    )
 
     return {
         "url": final_url,
@@ -557,12 +635,22 @@ def extract_product_content(url):
 
 
 def create_app(token=None):
-    configured_token = token if token is not None else __import__("os").environ.get("EXTRACT_API_TOKEN")
+    configured_token = token if token is not None else os.environ.get("EXTRACT_API_TOKEN")
     if not configured_token:
         raise RuntimeError("EXTRACT_API_TOKEN must be configured before starting the service")
 
+    runtime_config = load_runtime_config()
+    _configure_application_logging(runtime_config.log_level)
+
     app = Flask(__name__)
     app.config["EXTRACT_API_TOKEN"] = configured_token
+    app.config["PORT"] = runtime_config.port
+    app.config["UPSTREAM_TIMEOUT"] = runtime_config.request_timeout
+    extraction_slots = (
+        threading.BoundedSemaphore(runtime_config.max_concurrent_extractions)
+        if runtime_config.max_concurrent_extractions
+        else None
+    )
 
     @app.get("/health")
     def health():
@@ -591,6 +679,12 @@ def create_app(token=None):
         urls = request.args.getlist("url")
         if len(urls) != 1 or not urls[0].strip():
             return _safe_error("invalid_url", "Provide exactly one non-empty url query parameter.", 400)
+        if extraction_slots is not None and not extraction_slots.acquire(blocking=False):
+            LOG.info("Extraction rejected because the single extraction slot is occupied")
+            return _safe_error("extraction_busy", "An extraction is already in progress; retry later.", 503)
+
+        extraction_start = time.perf_counter()
+        LOG.debug("Extraction started mode=%s", mode or "full")
         try:
             if mode == "agent":
                 if include_links_values:
@@ -603,13 +697,21 @@ def create_app(token=None):
                 result = extract_product_content(urls[0])
             else:
                 result = extract_web_content(urls[0])
+            return jsonify(result)
         except ExtractionError as exc:
+            LOG.info("Extraction failed code=%s status=%d", exc.code, exc.status)
             return _safe_error(exc.code, exc.message, exc.status)
         except Exception as exc:
             # Avoid formatting arbitrary upstream exception strings, which may contain URLs.
             LOG.error("Unexpected extraction failure (%s)", type(exc).__name__)
             return _safe_error("upstream_fetch_failed", "The upstream page could not be fetched.", 502)
-        return jsonify(result)
+        finally:
+            LOG.debug(
+                "Extraction finished mode=%s elapsed_ms=%.1f",
+                mode or "full", (time.perf_counter() - extraction_start) * 1000,
+            )
+            if extraction_slots is not None:
+                extraction_slots.release()
 
     return app
 
@@ -618,12 +720,4 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    import os
-
-    if not LOG.handlers:
-        timing_handler = logging.StreamHandler()
-        timing_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        LOG.addHandler(timing_handler)
-    LOG.setLevel(logging.INFO)
-    LOG.propagate = False
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
+    app.run(host="0.0.0.0", port=app.config["PORT"], debug=False, threaded=True)
