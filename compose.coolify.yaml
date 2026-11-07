@@ -1,0 +1,34 @@
+services:
+  web-content-extractor:
+    image: ${WEB_CONTENT_EXTRACTOR_IMAGE:?Set an immutable GHCR image reference}
+    restart: unless-stopped
+    stop_grace_period: 35s
+    environment:
+      EXTRACT_API_TOKEN: ${EXTRACT_API_TOKEN:?Configure the protected runtime secret in Coolify}
+      PORT: ${PORT:-5000}
+      EXTRACT_CONNECT_TIMEOUT: ${EXTRACT_CONNECT_TIMEOUT:-10}
+      EXTRACT_READ_TIMEOUT: ${EXTRACT_READ_TIMEOUT:-20}
+      EXTRACT_LOG_LEVEL: ${EXTRACT_LOG_LEVEL:-INFO}
+      EXTRACT_MAX_CONCURRENT: ${EXTRACT_MAX_CONCURRENT:-1}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('PORT','5000'), timeout=2).read()"
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
